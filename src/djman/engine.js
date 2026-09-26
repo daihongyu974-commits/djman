@@ -243,23 +243,30 @@ function analyze(buf){
     shL[i] = Math.min(255, Math.round(Math.min(1, lo[i] * lo[i] / tot) * 255));
     shH[i] = Math.min(255, Math.round(Math.min(1, hi[i] * hi[i] / tot * 3) * 255));
   }
-  return { bpm:best, downbeat, firstSound, lastSound, inPoint, duration:buf.duration, fps, amp, shL, shH };
+  return { bpm:best, downbeat, firstSound, lastSound, inPoint, duration:buf.duration, fps, amp, shL, shH, key: detectKey(buf) };
 }
-async function decodeFile(file){
-  const ab = await file.arrayBuffer();
-  return await new Promise((res, rej) => { const pr = getCtx().decodeAudioData(ab, res, rej); if (pr && pr.then) pr.then(res, rej); });
+function decodeBytes(ab){
+  return new Promise((res, rej) => { const pr = getCtx().decodeAudioData(ab, res, rej); if (pr && pr.then) pr.then(res, rej); });
+}
+// local files are re-read from disk; Audius tracks are downloaded once and kept compressed in memory
+async function decodeTrack(t){
+  if (t.src && t.src.type === 'audius'){
+    if (!t.bytes) t.bytes = await fetchAudiusBytes(t.src.id);
+    return await decodeBytes(t.bytes.slice(0));   // decodeAudioData detaches its input, so decode a copy
+  }
+  return await decodeBytes(await t.file.arrayBuffer());
 }
 let analyzing = Promise.resolve();
 function queueAnalysis(t){
   analyzing = analyzing.then(async () => {
     try {
-      const buf = await decodeFile(t.file);
+      const buf = await decodeTrack(t);
       await new Promise(r => setTimeout(r, 0));
       Object.assign(t, analyze(buf), { status:'ready' });
       const i = tracks.indexOf(t), ci = curIndex();
       if (i >= 0 && (i === ci + 1 || (ci < 0 && i === 0))) bufCache.set(t.id, { promise:Promise.resolve(buf), buffer:buf });
-    } catch(e){ t.status = 'error'; }
-    renderList();
+    } catch(e){ t.status = 'error'; t.errMsg = t.src && t.src.type === 'audius' ? (e && e.message && !/decode/i.test(e.message) ? e.message : "Couldn't load this Audius track") : null; }
+    renderList(); renderAudius();
   });
 }
 function ensureBuffer(t){
@@ -267,7 +274,7 @@ function ensureBuffer(t){
   let e = bufCache.get(t.id);
   if (!e){
     e = { promise:null, buffer:null };
-    e.promise = decodeFile(t.file).then(b => { e.buffer = b; return b; }).catch(() => { bufCache.delete(t.id); return null; });
+    e.promise = decodeTrack(t).then(b => { e.buffer = b; return b; }).catch(() => { bufCache.delete(t.id); return null; });
     bufCache.set(t.id, e);
   }
   return e;
@@ -278,6 +285,108 @@ function pruneCache(){
   if (committed) keep.add(committed.inc.track.id);
   const n = tracks[curIndex() + 1]; if (n) keep.add(n.id);
   for (const id of [...bufCache.keys()]) if (!keep.has(id)) bufCache.delete(id);
+}
+
+// ---------- musical key (chroma + Krumhansl profiles) ----------
+const KEY_NAMES = ['C','C#','D','Eb','E','F','F#','G','Ab','A','Bb','B'];
+const PROF_MAJ = [6.35,2.23,3.48,2.33,4.38,4.09,2.52,5.19,2.39,3.66,2.29,2.88];
+const PROF_MIN = [6.33,2.68,3.52,5.38,2.60,3.53,2.54,4.75,3.98,2.69,3.34,3.17];
+function fftInPlace(re, im){
+  const n = re.length;
+  for (let i = 1, j = 0; i < n; i++){
+    let bit = n >> 1; for (; j & bit; bit >>= 1) j ^= bit; j ^= bit;
+    if (i < j){ let t = re[i]; re[i] = re[j]; re[j] = t; t = im[i]; im[i] = im[j]; im[j] = t; }
+  }
+  for (let len = 2; len <= n; len <<= 1){
+    const ang = -2 * Math.PI / len, wr = Math.cos(ang), wi = Math.sin(ang), h = len >> 1;
+    for (let i = 0; i < n; i += len){
+      let cr = 1, ci = 0;
+      for (let k = 0; k < h; k++){
+        const a = i + k, b = a + h;
+        const br = re[b] * cr - im[b] * ci, bi = re[b] * ci + im[b] * cr;
+        re[b] = re[a] - br; im[b] = im[a] - bi; re[a] += br; im[a] += bi;
+        const nr = cr * wr - ci * wi; ci = cr * wi + ci * wr; cr = nr;
+      }
+    }
+  }
+}
+function keyCorr(ch, prof, tonic){
+  let mx = 0, my = 0; for (let p = 0; p < 12; p++){ mx += ch[p]; my += prof[(p - tonic + 12) % 12]; } mx /= 12; my /= 12;
+  let sxy = 0, sxx = 0, syy = 0;
+  for (let p = 0; p < 12; p++){ const dx = ch[p] - mx, dy = prof[(p - tonic + 12) % 12] - my; sxy += dx * dy; sxx += dx * dx; syy += dy * dy; }
+  return sxy / Math.sqrt(sxx * syy || 1);
+}
+function detectKey(buf){
+  const sr = buf.sampleRate, c0 = buf.getChannelData(0), c1 = buf.numberOfChannels > 1 ? buf.getChannelData(1) : c0;
+  const D = 4, fs = sr / D, N = 4096, n = Math.floor(buf.length / D);
+  if (n < N * 3) return null;
+  const a = Math.exp(-2 * Math.PI * 2000 / sr); let y1 = 0, y2 = 0;
+  const x = new Float32Array(n);
+  for (let i = 0, j = 0; j < n; i++){ const v = (c0[i] + c1[i]) * 0.5; y1 = a * y1 + (1 - a) * v; y2 = a * y2 + (1 - a) * y1; if (i % D === D - 1) x[j++] = y2; }
+  const win = new Float64Array(N); for (let i = 0; i < N; i++) win[i] = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / (N - 1));
+  const pcOf = new Int8Array(N / 2).fill(-1);
+  for (let k = 1; k < N / 2; k++){ const f = k * fs / N; if (f < 60 || f > 2000) continue; pcOf[k] = ((Math.round(69 + 12 * Math.log2(f / 440)) % 12) + 12) % 12; }
+  const chroma = new Float64Array(12), re = new Float64Array(N), im = new Float64Array(N), cf = new Float64Array(12);
+  const frames = Math.min(300, Math.floor((n - N) / N)), step = Math.floor((n - N) / frames);
+  for (let fi = 0; fi < frames; fi++){
+    const off = fi * step;
+    for (let i = 0; i < N; i++){ re[i] = x[off + i] * win[i]; im[i] = 0; }
+    fftInPlace(re, im); cf.fill(0); let tot = 0;
+    for (let k = 1; k < N / 2; k++){ const pc = pcOf[k]; if (pc < 0) continue; const m = Math.sqrt(re[k] * re[k] + im[k] * im[k]); cf[pc] += m; tot += m; }
+    if (tot < 1e-4) continue;
+    for (let p = 0; p < 12; p++) chroma[p] += cf[p] / tot;
+  }
+  let best = null;
+  for (let tonic = 0; tonic < 12; tonic++) for (const [prof, minor] of [[PROF_MAJ, false], [PROF_MIN, true]]){
+    const r = keyCorr(chroma, prof, tonic); if (!best || r > best.r) best = { r, tonic, minor };
+  }
+  const majPc = best.minor ? (best.tonic + 3) % 12 : best.tonic, num = ((7 * majPc) % 12 + 7) % 12 + 1, letter = best.minor ? 'A' : 'B';
+  return { name: KEY_NAMES[best.tonic] + (best.minor ? 'm' : ''), camelot: num + letter, num, letter };
+}
+function keyDist(a, b){
+  if (!a || !b) return 3;
+  let d = Math.abs(a.num - b.num); d = Math.min(d, 12 - d);
+  return d + (a.letter === b.letter ? 0 : 1);
+}
+// ---------- harmonic ordering (Camelot distance + tempo, favouring rising BPM) ----------
+function transCost(a, b){
+  const m = tempoMatch(a.bpm, b.bpm), pct = (1 / m.ratio - 1) * 100;   // + = next song faster
+  return keyDist(a.key, b.key) + Math.abs(pct) / 2.5 + (pct < 0 ? -pct / 2.5 : 0) + (m.ok ? 0 : 4);
+}
+function harmonicOrder(list, start){
+  const rest = [...list], out = [];
+  let prev = start;
+  if (!prev){ rest.sort((x, y) => x.bpm - y.bpm); prev = rest.shift(); out.push(prev); }
+  while (rest.length){
+    let best = rest[0], bc = Infinity;
+    for (const t of rest){ const c = transCost(prev, t); if (c < bc){ bc = c; best = t; } }
+    out.push(best); rest.splice(rest.indexOf(best), 1); prev = best;
+  }
+  return out;
+}
+let manualOrder = false;
+function autoSort(batch){
+  let fixed = 0;
+  if (cur){ fixed = curIndex() + 1; if (committed) fixed = Math.max(fixed, tracks.indexOf(committed.inc.track) + 1); }
+  let head, pool;
+  if (batch && manualOrder){
+    // the user arranged the list by hand: keep it, only sort the new songs and add them at the end
+    const nb = new Set(batch);
+    head = tracks.filter((t, i) => !nb.has(t) || i < fixed);
+    pool = tracks.filter((t, i) => nb.has(t) && i >= fixed);
+  } else {
+    head = tracks.slice(0, fixed); pool = tracks.slice(fixed);
+  }
+  const sortable = pool.filter(t => t.status === 'ready'), others = pool.filter(t => t.status !== 'ready');
+  const start = [...head].reverse().find(t => t.status === 'ready') || null;
+  if (!sortable.length || (!start && sortable.length < 2)){ if (!batch) showToast('Needs at least two analyzed songs'); return; }
+  const ordered = harmonicOrder(sortable, start);
+  tracks.splice(0, tracks.length, ...head, ...ordered, ...others);
+  if (!batch) manualOrder = false;
+  forced = null;
+  if (ctx){ pruneCache(); const nx = tracks[curIndex() + 1]; if (nx && cur) ensureBuffer(nx); }
+  renderList();
+  showToast(cur ? 'Upcoming songs sorted by KEY / BPM' : 'Sorted by KEY / BPM');
 }
 
 // ================= settings =================
@@ -295,11 +404,11 @@ function applyEdit(s, k, v){ const n = { ...s }; n[k] = (k === 'bars' || k === '
 function sliderTarget(){ return { live: !!committed, s: resolveSet(globalSet), raw: globalSet }; }
 function setFromSlider(k, v){
   const t = sliderTarget();
-  if (k === 'bars' && t.s.blend === 'cut'){ showToast('Cut 没有长度'); return; }
-  if (k === 'blend' && t.s.exit === 'vinyl' && v !== 'cut'){ showToast('Vinyl Break 固定为 Cut'); renderDevice(); return; }
-  const names = { blend:'BLEND ' + BLENDS[v], build:'BUILD ' + BUILDS[v], exit:'EXIT ' + EXITS[v], bars:'BLEND ' + v + ' 小节' };
+  if (k === 'bars' && t.s.blend === 'cut'){ showToast('Cut has no length'); return; }
+  if (k === 'blend' && t.s.exit === 'vinyl' && v !== 'cut'){ showToast('Vinyl Break forces Cut'); renderDevice(); return; }
+  const names = { blend:'BLEND ' + BLENDS[v], build:'BUILD ' + BUILDS[v], exit:'EXIT ' + EXITS[v], bars:'BLEND ' + v + ' bars' };
   globalSet = applyEdit(globalSet, k, v);
-  if (t.live){ const msg = liveEdit(globalSet); showToast(msg ? names[k] + '：' + msg : names[k]); renderList(); return; }
+  if (t.live){ const msg = liveEdit(globalSet); showToast(msg || names[k]); renderList(); return; }
   showToast(names[k]);
   renderList();
 }
@@ -340,7 +449,7 @@ function tick(){
     const due = timers.filter(x => x.t <= now); timers = timers.filter(x => x.t > now);
     due.forEach(x => { try { x.fn(); } catch(e){ console.warn(e); } });
   }
-  if (scr && now - scr.lastMove > 0.05) scr.target = 0;
+  if (ctx.state === 'running') scheduleLoops(now);
   if (!playing || scr) return;
   if (cur && !committed){
     const plan = planNext();
@@ -525,12 +634,12 @@ function commit(plan, buf){
 // change BLEND / BUILD / EXIT while the transition is running
 function reschedule(want){
   const c = committed, p = c.plan, old = p.s, now = ctx.currentTime, tR = now + 0.03, bw = p.beatWall, Bw = p.barWall;
-  if (now >= c.Te - 0.02) return { s: old, msg: '过渡已进入尾声，改动留到下次' };
+  if (now >= c.Te - 0.02) return { s: old, msg: 'Transition ending, applies next time' };
   const s = { ...old, ...want }; let msg = '';
   const blendDone = old.blend === 'cut' ? now >= p.Tc - 0.02 : now >= p.T1 - 0.02;
-  if (s.build !== old.build && now >= p.T0 - 0.05){ s.build = old.build; msg = 'BUILD 已经结束'; }
-  if ((s.blend !== old.blend || (s.bars !== old.bars && s.blend !== 'cut')) && blendDone){ s.blend = old.blend; s.bars = old.bars; msg = 'BLEND 已经结束'; }
-  if (s.exit === 'vinyl' && s.blend !== 'cut'){ s.exit = old.exit; msg = msg || '现在不能换成 Vinyl Break'; }
+  if (s.build !== old.build && now >= p.T0 - 0.05){ s.build = old.build; msg = 'BUILD is over, applies next time'; }
+  if ((s.blend !== old.blend || (s.bars !== old.bars && s.blend !== 'cut')) && blendDone){ s.blend = old.blend; s.bars = old.bars; msg = 'BLEND is over, applies next time'; }
+  if (s.exit === 'vinyl' && s.blend !== 'cut'){ s.exit = old.exit; msg = msg || "Can't switch to Vinyl Break now"; }
   const np = { ...p, s, hold:null };
   np.buildBars = BUILD_BARS[s.build]; np.Tb = p.T0 - np.buildBars * Bw;
   if (s.blend === 'cut'){
@@ -565,7 +674,7 @@ function reschedule(want){
 }
 function liveEdit(raw){
   const res = reschedule(resolveSet(raw));
-  return res.msg ? res.msg + '，下一次过渡生效' : '';
+  return res.msg || '';
 }
 function finalize(){
   const { out, inc, slot } = committed;
@@ -607,7 +716,7 @@ async function startFrom(i){
   renderList();
 }
 async function togglePlay(){
-  if (!cur){ const i = tracks.findIndex(t => t.status === 'ready'); if (i >= 0) await startFrom(i); else showToast('先添加本地音乐'); return; }
+  if (!cur){ const i = tracks.findIndex(t => t.status === 'ready'); if (i >= 0) await startFrom(i); else showToast('Add local music first'); return; }
   if (scr) return;
   if (ctx.state === 'running'){ await ctx.suspend(); playing = false; }
   else { await ctx.resume(); playing = true; }
@@ -619,11 +728,11 @@ function seekTo(pos){
   forced = null;
 }
 function mixNow(){
-  if (!cur || committed || !playing){ showToast(committed ? '过渡进行中' : '先开始播放'); return; }
-  const ci = curIndex(); if (!tracks[ci + 1]){ showToast('这是最后一首'); return; }
+  if (!cur || committed || !playing){ showToast(committed ? 'Transition in progress' : 'Start playback first'); return; }
+  const ci = curIndex(); if (!tracks[ci + 1]){ showToast('This is the last song'); return; }
   const s = resolve(ci), t = cur.track, barBuf = 4 * 60 / t.bpm;
   forced = { P0: nextBarAfter(t, cur.posAt(ctx.currentTime) + BUILD_BARS[s.build] * barBuf + 0.7) };
-  showToast('下一个小节开始过渡');
+  showToast('Mixing at the next bar');
 }
 function jumpToTransition(){
   if (!cur || committed) return;
@@ -632,43 +741,96 @@ function jumpToTransition(){
 }
 
 // ================= jog: move forward / back =================
+const SCRATCH_SEC_PER_REV = 1.8;                          // like a 33⅓ rpm record
+const coarseSecPerRev = t => 32 * 4 * 60 / t.bpm;         // Shift + jog: ~32 bars per turn
 function startNav(){
-  if (!cur || !ctx || committed) return false;
+  if (!cur || !ctx || committed || scr) return false;
   if (fx.active === 'roll'){ fxOff('roll'); fx.active = null; renderDevice(); }
   const now = ctx.currentTime, d = cur, live = playing && ctx.state === 'running';
-  scr = { deck:d, pos: d.posAt(now), vel: live ? d.rateAt(now) : 0, target: 0, lastMove: now, live, sp:null };
+  const st = { deck:d, pos: d.posAt(now), vel: live ? d.rateAt(now) : 0, rate: d.rateAt(now), live, sp:null,
+    coarse:false, usedCoarse:false, release:false, handT:null, started:false, lastEnd: now, lastEndPos: 0, lpL:0, lpR:0 };
+  st.target = st.pos;
+  scr = st;
   if (live){
+    // The platter position follows the hand; the audio position chases it with a short
+    // spring, so the pitch/speed changes smoothly and backspins sound natural.
     const buf = d.buf, sp = ctx.createScriptProcessor(512, 1, 2);
     const L = buf.getChannelData(0), R = buf.numberOfChannels > 1 ? buf.getChannelData(1) : L;
-    const sr = buf.sampleRate, alpha = 1 - Math.exp(-1 / (0.015 * ctx.sampleRate)), dur = buf.duration;
+    const sr = buf.sampleRate, osr = ctx.sampleRate, dur = buf.duration;
+    const aVel = 1 - Math.exp(-1 / (0.006 * osr)), aRel = 1 - Math.exp(-1 / (0.035 * osr));
     sp.onaudioprocess = e => {
-      const oL = e.outputBuffer.getChannelData(0), oR = e.outputBuffer.getChannelData(1);
-      const s = scr; if (!s || s.sp !== sp){ oL.fill(0); oR.fill(0); return; }
-      for (let i = 0; i < oL.length; i++){
-        s.vel += (s.target - s.vel) * alpha;
-        s.pos += s.vel / ctx.sampleRate;
-        if (s.pos < 0) s.pos = 0; if (s.pos > dur - 0.01) s.pos = dur - 0.01;
-        const g = Math.min(1, 2.5 / Math.max(1, Math.abs(s.vel)));
-        const x = s.pos * sr, j = Math.floor(x), f = x - j;
-        oL[i] = (L[j] * (1 - f) + L[j + 1] * f) * g; oR[i] = (R[j] * (1 - f) + R[j + 1] * f) * g;
+      const oL = e.outputBuffer.getChannelData(0), oR = e.outputBuffer.getChannelData(1), n = oL.length;
+      const T0 = e.playbackTime || ctx.currentTime;
+      if (!st.started){
+        // seamless touch: take over exactly where the deck is when this block plays
+        st.started = true;
+        const p0 = d.posAt(T0), shift = p0 - st.pos; st.pos += shift; st.target += shift;
+        try { d.src.stop(T0); } catch(err){}
       }
+      for (let i = 0; i < n; i++){
+        const t = T0 + i / osr;
+        if (st.handT != null && t >= st.handT + 0.006){ oL[i] = oR[i] = 0; continue; }
+        if (st.coarse){ st.pos = st.target; st.vel = 0; oL[i] = oR[i] = 0; continue; }
+        if (st.release) st.vel += (st.rate - st.vel) * aRel;
+        else {
+          let vd = (st.target - st.pos) / 0.02;
+          if (vd > 14) vd = 14; else if (vd < -14) vd = -14;
+          st.vel += (vd - st.vel) * aVel;
+        }
+        st.pos += st.vel / osr;
+        if (st.pos < 0){ st.pos = 0; st.vel = 0; } else if (st.pos > dur - 0.01){ st.pos = dur - 0.01; st.vel = 0; }
+        const x = st.pos * sr, j = Math.floor(x), f = x - j;
+        const l = L[j] * (1 - f) + L[j + 1] * f, r = R[j] * (1 - f) + R[j + 1] * f;
+        const spd = Math.abs(st.vel), a = Math.exp(-2 * Math.PI * (spd > 1 ? 16000 / spd : 16000) / osr);
+        st.lpL = a * st.lpL + (1 - a) * l; st.lpR = a * st.lpR + (1 - a) * r;
+        const g = st.handT != null && t > st.handT ? Math.max(0, 1 - (t - st.handT) / 0.006) : 1;
+        oL[i] = st.lpL * g; oR[i] = st.lpR * g;
+      }
+      st.lastEnd = T0 + n / osr; st.lastEndPos = st.pos;
     };
-    sp.connect(d.eqL); scr.sp = sp;
-    try { d.src.stop(now + 0.01); } catch(e){}
+    sp.connect(d.eqL); st.sp = sp;
   }
   return true;
 }
-function navMove(deltaSec, dt){
-  if (!scr) return;
-  if (scr.live){ scr.target = Math.max(-16, Math.min(16, deltaSec / dt)); scr.lastMove = ctx.currentTime; }
-  else scr.pos = Math.max(0, Math.min(scr.deck.track.duration - 0.5, scr.pos + deltaSec));
+function navMove(delta, coarse){
+  const st = scr; if (!st) return;
+  const dur = st.deck.track.duration;
+  if (coarse){
+    st.coarse = true; st.usedCoarse = true;
+    st.target = Math.max(0, Math.min(dur - 0.5, st.target + delta)); st.pos = st.target; st.vel = 0;
+    showToast('Seek ' + mmss(st.pos) + ' / ' + mmss(dur));
+    return;
+  }
+  if (st.coarse){ st.coarse = false; st.target = st.pos; st.vel = 0; }
+  st.target = Math.max(0, Math.min(dur - 0.02, st.target + delta));
+  if (!st.live) st.pos = Math.min(dur - 0.5, st.target);
 }
 function endNav(){
-  if (!scr) return;
-  const { deck, sp, pos } = scr; scr = null;
-  if (deck === cur) deck.reposition(ctx.currentTime + 0.02, Math.max(0, Math.min(pos, deck.track.duration - 0.5)));
-  forced = null;
-  if (sp) setTimeout(() => { try { sp.disconnect(); } catch(e){} }, 80);
+  const st = scr; if (!st || st.ending) return;
+  st.ending = true;
+  const deck = st.deck;
+  const finish = (when, pos) => {
+    if (scr === st) scr = null;
+    if (deck === cur) deck.reposition(when, Math.max(0, Math.min(pos, deck.track.duration - 0.5)));
+    forced = null;
+    if (st.sp) setTimeout(() => { try { st.sp.disconnect(); } catch(e){} }, Math.max(120, (when - ctx.currentTime) * 1000 + 120));
+  };
+  if (!st.live || st.coarse){
+    let pos = st.target;
+    if (st.coarse){ const t = deck.track, bar = 4 * 60 / t.bpm; pos = t.downbeat + Math.round((pos - t.downbeat) / bar) * bar; }
+    st.handT = ctx.currentTime;
+    finish(ctx.currentTime + 0.03, pos);
+    return;
+  }
+  // like a DJ controller: let go and the motor brings the record back up to speed,
+  // then the deck takes over from the exact position the platter reached
+  st.release = true; st.rate = deck.rateAt(ctx.currentTime);
+  setTimeout(() => {
+    const now = ctx.currentTime, handT = Math.max(now + 0.03, st.lastEnd) + 0.01;
+    const pos = st.lastEndPos + (handT - st.lastEnd) * st.vel;
+    st.handT = handT;
+    finish(handT, pos);
+  }, 110);
 }
 
 // ================= master fx =================
@@ -718,7 +880,7 @@ function setFx(n){
   if (next !== fx.active){
     if (fx.active) fxOff(fx.active);
     fx.active = next;
-    if (next === 'roll' && (committed || !cur)) showToast(committed ? '过渡进行中，Roll 暂不可用' : 'Roll 需要先开始播放');
+    if (next === 'roll' && (committed || !cur)) showToast(committed ? 'Roll unavailable during a transition' : 'Roll needs playback');
     else showToast('FX ' + FX_NAMES[n]);
     if (fx.active) fxOn(fx.active, true);
   }
@@ -740,7 +902,21 @@ function filterText(){
   const v = fx.filter, f = filterFreqs(v), fmt = x => x >= 1000 ? (x / 1000).toFixed(1) + 'k' : Math.round(x) + '';
   return v < -0.03 ? 'LPF ' + fmt(f.lp) : v > 0.03 ? 'HPF ' + fmt(f.hp) : 'OFF';
 }
-function setAmt(v){ fx.amt = Math.max(0, Math.min(1, v)); if (ctx && fx.active) fxOn(fx.active, false); showToast('FX 强度 ' + Math.round(fx.amt * 100) + '%'); renderDevice(); }
+// keyboard [ / ] for the amount lever: a tap nudges it, holding sweeps it smoothly
+const amtKeys = { dec:false, inc:false, since:0, t:0 };
+const AMT_TAP = 0.01, AMT_RATE = 0.4;   // per tap / per second while held
+function amtKeyDir(e){
+  if (e.code === 'BracketLeft' || e.key === '[' || e.key === '【') return 'dec';
+  if (e.code === 'BracketRight' || e.key === ']' || e.key === '】') return 'inc';
+  return null;
+}
+function stepAmtKeys(){
+  if (amtKeys.dec === amtKeys.inc) return;
+  const now = performance.now(), dt = Math.min(0.05, (now - amtKeys.t) / 1000); amtKeys.t = now;
+  if (now - amtKeys.since < 180) return;
+  setAmt(fx.amt + (amtKeys.inc ? 1 : -1) * AMT_RATE * dt);
+}
+function setAmt(v){ fx.amt = Math.max(0, Math.min(1, v)); if (ctx && fx.active) fxOn(fx.active, false); showToast('FX amount ' + Math.round(fx.amt * 100) + '%'); renderDevice(); }
 function showToast(text){ toast = { text, until: performance.now() + 1300 }; }
 
 // ================= samples (synthesised placeholders) =================
@@ -849,16 +1025,82 @@ const SYN = {
 const sampleName = cat => SAMPLES[cat][sampleSet % SAMPLES[cat].length];
 function playSample(cat){
   getCtx();
+  lastPad = cat;
+  if (loops[cat]){ stopLoop(cat); return; }
   if (ctx.state !== 'running'){
-    if (cur){ showToast('播放时才能触发采样'); return; }
+    if (cur){ showToast('Resume playback to play samples'); return; }
     ctx.resume();
   }
   const name = sampleName(cat);
   try { SYN[name](ctx.currentTime + 0.01, M.sampleBus); } catch(e){ console.warn(e); }
-  const pad = dev.querySelector(`.pad[data-pad="${cat}"] .pad-bg`);
-  if (pad){ pad.setAttribute('fill', '#9A9A9A'); setTimeout(() => pad.setAttribute('fill', '#7C7C7C'), 120); }
+  flashPad(cat);
 }
-function nextSampleSet(){ sampleSet = (sampleSet + 1) % NSETS; renderDevice(); showToast('采样组 ' + (sampleSet + 1) + ' / ' + NSETS); }
+function nextSampleSet(){ sampleSet = (sampleSet + 1) % NSETS; renderDevice(); showToast('Sample set ' + (sampleSet + 1) + ' / ' + NSETS); }
+// ---------- sample loops (Shift after a pad) ----------
+const LOOP_BEATS = { Clap:2, Kick:1, Snare:2, Hat:0.5, Shaker:0.5, Rim:1, Tom:2, Perc:1,
+  Horn:4, Bell:2, Whistle:4, Hit:4, Coin:2, Camera:2, Door:2, Laugh:4,
+  'Piano Stab':2, 'Synth Stab':1, 'Bass Hit':2, Chord:4, Riff:1, Pluck:1,
+  Hey:2, Yeah:2, Woo:4, Oh:4, 'Come On':4, "Let's Go":4, 'Crowd Chant':4 };
+const loops = {};            // pad -> loop state
+let lastPad = null, freeBpm = 120;
+const shiftState = { held:false, used:false };
+const fmtBeats = b => b >= 4 ? (b === 4 ? '1 bar' : (b / 4) + ' bars') : b >= 1 ? (b === 1 ? '1 beat' : b + ' beats') : '1/' + Math.round(1 / b) + ' beat';
+function nextGridPos(deck, tMin, quantum){
+  const t = deck.track, qb = 60 / t.bpm * quantum, p = deck.posAt(tMin);
+  return t.downbeat + Math.ceil((p - t.downbeat) / qb - 1e-6) * qb;
+}
+function startLoop(cat){
+  getCtx();
+  if (cur && ctx.state !== 'running'){ showToast('Resume playback to loop'); return; }
+  if (ctx.state !== 'running') ctx.resume();
+  const name = sampleName(cat), beats = LOOP_BEATS[name] || 1;
+  const L = { cat, beats, q: Math.min(1, beats), deck:null, nextP:0, nextT:null };
+  if (cur){ L.deck = cur; L.nextP = nextGridPos(cur, ctx.currentTime + 0.03, L.q); }
+  else L.nextT = ctx.currentTime + 0.03;
+  loops[cat] = L;
+  renderDevice(); showToast('LOOP ' + name.toUpperCase() + ', every ' + fmtBeats(beats));
+}
+function stopLoop(cat){ delete loops[cat]; renderDevice(); showToast('LOOP off'); }
+function toggleLoopLast(){
+  if (!lastPad){ showToast('Press a pad, then SHIFT'); return; }
+  loops[lastPad] ? stopLoop(lastPad) : startLoop(lastPad);
+}
+function scheduleLoops(now){
+  if (cur) freeBpm = curBpm();
+  for (const cat in loops){
+    const L = loops[cat];
+    for (let guard = 0; guard < 16; guard++){
+      let t;
+      if (cur){
+        if (L.deck !== cur){
+          // the track changed (or playback started): carry the loop over to the new beat grid
+          const tPrev = L.deck ? L.deck.timeAtPos(L.nextP) : L.nextT;
+          L.deck = cur; L.nextP = nextGridPos(cur, Math.max(tPrev, now + 0.01), L.q);
+        }
+        t = cur.timeAtPos(L.nextP);
+        const beat = 60 / curBpm();
+        if (t < now - 0.05 || t > now + L.beats * beat + 0.3){ L.nextP = nextGridPos(cur, now + 0.02, L.q); t = cur.timeAtPos(L.nextP); }
+      } else {
+        if (L.deck){ L.nextT = Math.max(now + 0.01, L.deck.timeAtPos(L.nextP)); L.deck = null; }
+        if (L.nextT < now - 0.05) L.nextT = now + 0.01;
+        t = L.nextT;
+      }
+      if (t > now + 0.25) break;
+      try { SYN[sampleName(cat)](Math.max(t, now + 0.005), M.sampleBus); } catch(e){}
+      setTimeout(() => flashPad(cat), Math.max(0, (t - ctx.currentTime) * 1000));
+      if (cur) L.nextP += L.beats * 60 / cur.track.bpm;
+      else L.nextT = t + L.beats * 60 / freeBpm;
+    }
+  }
+}
+function padColors(cat){ return loops[cat] ? { bg:'#CFCEC7', flash:'#ECEAE2', name:INK, cat:'#4A4A4A' } : { bg:'#7C7C7C', flash:'#9A9A9A', name:CREAM, cat:'#D8CFBD' }; }
+function flashPad(cat){
+  const pad = dev.querySelector(`.pad[data-pad="${cat}"] .pad-bg`); if (!pad) return;
+  pad.setAttribute('fill', padColors(cat).flash); setTimeout(() => pad.setAttribute('fill', padColors(cat).bg), 110);
+}
+function shiftDown(){ if (shiftState.held) return; shiftState.held = true; shiftState.used = false; renderShift(); }
+function shiftUp(){ if (!shiftState.held) return; shiftState.held = false; if (!shiftState.used) toggleLoopLast(); renderShift(); }
+function renderShift(){ const f = dev.querySelector('#shiftFace'); if (f) f.setAttribute('fill', shiftState.held ? '#B9A986' : BODY); }
 
 // ================= device SVG =================
 const INK = '#1b1b1b', BODY = '#E8D9B8', GREY = '#6E6E6E', RED = '#C0403A', ROD = '#C9B78F', JOG = '#E9E0CC', CREAM = '#F3EBDA';
@@ -889,7 +1131,7 @@ function buildDeviceSVG(){
       <g class="sl-knob drag"><circle cx="${f.x}" cy="0" r="22" fill="${GREY}" stroke="${INK}" stroke-width="3" filter="url(#knobShadow)"/><circle cx="${f.x - 12}" cy="0" r="4.5" fill="#fff" stroke="${INK}" stroke-width="1.5"/><circle class="focus-ring" cx="${f.x}" cy="0" r="28"/></g>
     </g>`;
   }).join('');
-  const bars = [4, 8, 16].map((n, i) => `<g class="hit bar-key" data-bars="${n}" tabindex="0" role="button" aria-label="交接长度 ${n} 小节">
+  const bars = [4, 8, 16].map((n, i) => `<g class="hit bar-key" data-bars="${n}" tabindex="0" role="button" aria-label="Blend length ${n} bars">
       <rect class="bk-bg" x="${318 + i * 40}" y="604" width="34" height="30" rx="7" fill="${BODY}" stroke="${INK}" stroke-width="2"/>
       <text class="bk-tx" x="${335 + i * 40}" y="624" text-anchor="middle" font-family="${FONT}" font-weight="800" font-size="14" fill="${INK}">${n}</text>
       <rect class="focus-ring" x="${314 + i * 40}" y="600" width="42" height="38" rx="9"/></g>`).join('');
@@ -902,21 +1144,25 @@ function buildDeviceSVG(){
     const x = 538 + i * 107;
     return `<g class="hit pad" data-pad="${k}" tabindex="0" role="button">
       <rect class="pad-bg" x="${x}" y="951" width="95" height="95" rx="11" fill="#7C7C7C" stroke="${INK}" stroke-width="2.5"/>
-      <text x="${x + 47.5}" y="982" text-anchor="middle" font-family="${FONT}" font-weight="700" font-size="12" fill="#D8CFBD" letter-spacing=".06em">${label}</text>
+      <text class="pad-cat" x="${x + 47.5}" y="982" text-anchor="middle" font-family="${FONT}" font-weight="700" font-size="12" fill="#D8CFBD" letter-spacing=".06em">${label}</text>
       <text class="pad-name" x="${x + 47.5}" y="1016" text-anchor="middle" font-family="${FONT}" font-weight="800" font-size="16" fill="${CREAM}"></text>
+      <text class="pad-loop" x="${x + 47.5}" y="1036" text-anchor="middle" font-family="${FONT}" font-weight="800" font-size="10" fill="${RED}" letter-spacing=".12em" opacity="0">LOOP</text>
       <rect class="focus-ring" x="${x - 4}" y="947" width="103" height="103" rx="14"/></g>`;
   }).join('');
   return `
   <defs><filter id="knobShadow" x="-30%" y="-30%" width="160%" height="170%"><feDropShadow dx="0" dy="3" stdDeviation="2.5" flood-opacity=".25"/></filter></defs>
-  <g id="volTab" class="hit" tabindex="0" role="button" aria-label="音量侧键，点上半部分加，下半部分减">
+  <g id="volTab" class="hit" tabindex="0" role="button" aria-label="Volume side key: click the top half for louder, the bottom half for quieter">
     <rect x="2" y="118" width="16" height="172" rx="8" fill="${BODY}" stroke="${INK}" stroke-width="2.5"/>
     <rect class="focus-ring" x="-3" y="113" width="26" height="182" rx="12"/></g>
-  <rect x="2" y="908" width="16" height="80" rx="8" fill="${BODY}" stroke="${INK}" stroke-width="2.5"/>
-  <g id="setBtn" class="hit" tabindex="0" role="button" aria-label="切换到下一组采样">
+  <g id="shiftTab" class="hit" tabindex="0" role="button" aria-label="SHIFT side key: tap to loop the last sample; hold while turning the jog wheel to seek quickly">
+    <rect id="shiftFace" x="2" y="908" width="16" height="80" rx="8" fill="${BODY}" stroke="${INK}" stroke-width="2.5"/>
+    <rect class="focus-ring" x="-3" y="903" width="26" height="90" rx="12"/></g>
+  <text x="-10" y="948" transform="rotate(-90 -10 948)" text-anchor="middle" font-family="${FONT}" font-weight="800" font-size="12" fill="#8a8a84" letter-spacing=".08em" pointer-events="none">SHIFT</text>
+  <g id="setBtn" class="hit" tabindex="0" role="button" aria-label="Next sample set">
     <rect id="setFace" x="1098" y="262" width="16" height="124" rx="8" fill="${RED}" stroke="${INK}" stroke-width="2.5"/>
     <rect class="focus-ring" x="1093" y="257" width="26" height="134" rx="12"/></g>
   <rect x="28" y="22" width="1068" height="1066" rx="58" fill="${BODY}" stroke="${INK}" stroke-width="3"/>
-  <g id="lever" class="drag" tabindex="0" role="slider" aria-label="FX 强度拨杆" aria-valuemin="0" aria-valuemax="100">
+  <g id="lever" class="drag" tabindex="0" role="slider" aria-label="FX amount lever" aria-valuemin="0" aria-valuemax="100">
     <path d="M${LC.x} ${LC.y - LC.r} A${LC.r} ${LC.r} 0 0 1 ${LC.x + LC.r} ${LC.y}" fill="none" stroke="${INK}" stroke-width="30" stroke-linecap="round"/>
     <path d="M${LC.x} ${LC.y - LC.r} A${LC.r} ${LC.r} 0 0 1 ${LC.x + LC.r} ${LC.y}" fill="none" stroke="#B9A986" stroke-width="24" stroke-linecap="round"/>
     <path id="leverFill" fill="none" stroke="${RED}" stroke-width="24" stroke-linecap="round"/>
@@ -930,12 +1176,12 @@ function buildDeviceSVG(){
   <text x="318" y="660" font-family="${FONT}" font-weight="800" font-size="12" fill="${INK}" letter-spacing=".08em">BARS</text>
 
   <text x="${RC.x}" y="84" text-anchor="middle" font-family="${FONT}" font-weight="800" font-size="37" fill="${INK}">I</text>
-  <g id="fxRing" tabindex="0" role="slider" aria-label="效果转环" aria-valuemin="0" aria-valuemax="5">
+  <g id="fxRing" tabindex="0" role="slider" aria-label="FX ring" aria-valuemin="0" aria-valuemax="5">
     <circle cx="${RC.x}" cy="${RC.y}" r="191" fill="${GREY}" stroke="${INK}" stroke-width="3" class="drag"/>
     <circle class="focus-ring" cx="${RC.x}" cy="${RC.y}" r="197"/>
     <g id="ringRot">${ring}</g>
   </g>
-  <g id="filterKnob" tabindex="0" role="slider" aria-label="FILTER 旋钮，向左低通，向右高通，双击回中" aria-valuemin="-100" aria-valuemax="100" class="drag">
+  <g id="filterKnob" tabindex="0" role="slider" aria-label="FILTER knob: left for low-pass, right for high-pass, double-click to center" aria-valuemin="-100" aria-valuemax="100" class="drag">
     <circle cx="${RC.x}" cy="${RC.y}" r="96" fill="${GREY}" stroke="${INK}" stroke-width="3"/>
     <path id="filterArc" fill="none" stroke="${CREAM}" stroke-width="6" stroke-linecap="round"/>
     <line id="filterPtr" x1="${RC.x}" y1="${RC.y}" stroke="${INK}" stroke-width="6" stroke-linecap="round"/>
@@ -947,16 +1193,16 @@ function buildDeviceSVG(){
     <circle class="focus-ring" cx="${RC.x}" cy="${RC.y}" r="101"/>
   </g>
 
-  <g id="jog" class="drag" aria-label="转盘，拖动外圈前进或后退">
+  <g id="jog" class="drag" aria-label="Jog wheel: drag the outer ring to scratch">
     <circle cx="${JC.x}" cy="${JC.y}" r="186" fill="${JOG}" stroke="${INK}" stroke-width="3"/>
     <g id="jogRot"><line x1="${JC.x}" y1="${JC.y - 172}" x2="${JC.x}" y2="${JC.y - 150}" stroke="#CDBF9F" stroke-width="5" stroke-linecap="round"/></g>
   </g>
   <line x1="976" y1="700" x2="1062" y2="700" stroke="#111" stroke-width="6" stroke-linecap="round" pointer-events="none"/>
-  <g id="playBtn" class="hit" tabindex="0" role="button" aria-label="播放 / 暂停">
+  <g id="playBtn" class="hit" tabindex="0" role="button" aria-label="Play / pause">
     <circle id="playFace" cx="${JC.x}" cy="${JC.y}" r="48" fill="${RED}" stroke="${INK}" stroke-width="3"/>
     <circle class="focus-ring" cx="${JC.x}" cy="${JC.y}" r="54"/></g>
 
-  <g id="mixBtn" class="hit" tabindex="0" role="button" aria-label="立即过渡">
+  <g id="mixBtn" class="hit" tabindex="0" role="button" aria-label="Transition now">
     <rect id="mixFace" x="345" y="800" width="98" height="56" rx="12" fill="${GREY}" stroke="${INK}" stroke-width="2.5"/>
     <text x="394" y="834" text-anchor="middle" font-family="${FONT}" font-weight="800" font-size="17" fill="${CREAM}" pointer-events="none">MIX</text>
     <rect class="focus-ring" x="340" y="795" width="108" height="66" rx="15"/></g>
@@ -1017,12 +1263,16 @@ function renderDevice(){
   dev.querySelectorAll('.pad').forEach(g => {
     const name = sampleName(g.dataset.pad), tx = g.querySelector('.pad-name');
     tx.textContent = name.toUpperCase(); tx.setAttribute('font-size', name.length > 9 ? 12.5 : name.length > 6 ? 14.5 : 16);
+    const pc = padColors(g.dataset.pad), on = !!loops[g.dataset.pad];
+    g.querySelector('.pad-bg').setAttribute('fill', pc.bg); tx.setAttribute('fill', pc.name);
+    g.querySelector('.pad-cat').setAttribute('fill', pc.cat); g.querySelector('.pad-loop').setAttribute('opacity', on ? 1 : 0);
+    g.setAttribute('aria-pressed', on);
     g.setAttribute('aria-label', PADS.find(p => p[0] === g.dataset.pad)[1] + ' ' + name);
   });
   Q('#setText').textContent = `SET ${sampleSet + 1} / ${NSETS}`;
   const isPlaying = playing && ctx && ctx.state === 'running';
   Q('#playFace').setAttribute('fill', isPlaying ? '#D24A43' : RED);
-  Q('#playBtn').setAttribute('aria-label', isPlaying ? '暂停' : '播放');
+  Q('#playBtn').setAttribute('aria-label', isPlaying ? 'Pause' : 'Play');
 }
 
 // faders
@@ -1086,7 +1336,7 @@ dev.querySelectorAll('.bar-key').forEach(el => {
   g.addEventListener('pointerdown', e => { e.stopPropagation(); getCtx(); drag = { y: e.clientY, x: e.clientX, v: fx.filter }; g.setPointerCapture(e.pointerId); });
   g.addEventListener('pointermove', e => { if (drag) setF(drag.v + ((drag.y - e.clientY) + (e.clientX - drag.x)) / 180); });
   g.addEventListener('pointerup', () => drag = null); g.addEventListener('pointercancel', () => drag = null);
-  g.addEventListener('dblclick', () => { setF(0); showToast('FILTER 回中'); });
+  g.addEventListener('dblclick', () => { setF(0); showToast('FILTER centered'); });
   g.addEventListener('wheel', e => { e.preventDefault(); getCtx(); setF(fx.filter - Math.sign(e.deltaY) * 0.05); }, { passive:false });
   g.addEventListener('keydown', e => {
     if (e.key === 'ArrowUp' || e.key === 'ArrowRight'){ e.preventDefault(); getCtx(); setF(fx.filter + 0.05); }
@@ -1112,15 +1362,16 @@ dev.querySelectorAll('.bar-key').forEach(el => {
   const g = Q('#jog'); let drag = null;
   const ang = p => Math.atan2(p.y - JC.y, p.x - JC.x);
   g.addEventListener('pointerdown', e => {
-    if (!startNav()){ showToast(committed ? '过渡进行中，转盘暂不可用' : '先开始播放'); return; }
+    if (e.shiftKey || shiftState.held) shiftState.used = true;
+    if (!startNav()){ if (!scr) showToast(committed ? 'Jog locked during a transition' : 'Start playback first'); return; }
     drag = { a: ang(svgPt(e)), t: performance.now() }; g.setPointerCapture(e.pointerId);
   });
   g.addEventListener('pointermove', e => {
     if (!drag || !scr) return;
     const a = ang(svgPt(e)), now = performance.now();
     let d = a - drag.a; if (d > Math.PI) d -= 2 * Math.PI; if (d < -Math.PI) d += 2 * Math.PI;
-    const secPerRev = 16 * 60 / scr.deck.track.bpm;
-    navMove(d / (2 * Math.PI) * secPerRev, Math.max(0.004, (now - drag.t) / 1000));
+    const coarse = e.shiftKey || shiftState.held; if (coarse) shiftState.used = true;
+    navMove(d / (2 * Math.PI) * (coarse ? coarseSecPerRev(scr.deck.track) : SCRATCH_SEC_PER_REV), coarse);
     drag.a = a; drag.t = now;
   });
   const end = () => { if (!drag) return; drag = null; endNav(); };
@@ -1131,9 +1382,16 @@ const onActivate = (el, fn) => { el.addEventListener('click', fn); el.addEventLi
 onActivate(Q('#playBtn'), () => togglePlay());
 onActivate(Q('#mixBtn'), () => { pressFlash(Q('#mixFace')); mixNow(); });
 onActivate(Q('#setBtn'), () => { Q('#setFace').setAttribute('transform', 'translate(-3 0)'); setTimeout(() => Q('#setFace').removeAttribute('transform'), 140); nextSampleSet(); });
-const volStep = d => { fx.vol = Math.max(0, Math.min(1, fx.vol + d)); if (ctx) M.vol.gain.setTargetAtTime(fx.vol * fx.vol * 1.2, ctx.currentTime, 0.02); showToast('音量 ' + Math.round(fx.vol * 100) + '%'); };
+const volStep = d => { fx.vol = Math.max(0, Math.min(1, fx.vol + d)); if (ctx) M.vol.gain.setTargetAtTime(fx.vol * fx.vol * 1.2, ctx.currentTime, 0.02); showToast('Volume ' + Math.round(fx.vol * 100) + '%'); };
 Q('#volTab').addEventListener('click', e => volStep(svgPt(e).y < 204 ? 0.1 : -0.1));
 Q('#volTab').addEventListener('keydown', e => { if (e.key === 'ArrowUp'){ e.preventDefault(); volStep(0.1); } if (e.key === 'ArrowDown'){ e.preventDefault(); volStep(-0.1); } });
+(() => {
+  const g = Q('#shiftTab');
+  g.addEventListener('pointerdown', e => { e.preventDefault(); try { g.setPointerCapture(e.pointerId); } catch(err){} shiftDown(); });
+  g.addEventListener('pointerup', () => shiftUp());
+  g.addEventListener('pointercancel', () => { shiftState.used = true; shiftUp(); });
+  g.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' '){ e.preventDefault(); e.stopPropagation(); toggleLoopLast(); } });
+})();
 dev.querySelectorAll('.pad').forEach(g => {
   g.addEventListener('pointerdown', e => { e.preventDefault(); playSample(g.dataset.pad); });
   g.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' '){ e.preventDefault(); playSample(g.dataset.pad); } });
@@ -1183,15 +1441,15 @@ function laneData(slot){
     const endPos = committed ? cur.posAt(committed.Te) : null;
     const cues = plan ? [plan.P0 - plan.buildBars * plan.barBuf, plan.P0].concat(plan.blendBars ? [plan.P0 + plan.blendBars * plan.barBuf] : []) : [];
     return { t: cur.track, pos, gridBpm: cur.gridBpm, bpm: cur.track.bpm * cur.rateAt(now), sync: cur.synced || Math.abs(cur.rateAt(now) - 1) > 0.001,
-      sub: scr ? (scr.live ? '转盘移动中' : '定位中') : (playing ? '正在播放' : '已暂停'), cues, endPos, lines: L && !scr ? L.out : [], bw: L && L.bw };
+      sub: scr ? (scr.coarse ? 'Seeking' : scr.live ? 'Scratching' : 'Cueing') : (playing ? 'Playing' : 'Paused'), cues, endPos, lines: L && !scr ? L.out : [], bw: L && L.bw };
   }
   if (committed){
     const d = committed.inc;
-    return { t: d.track, pos: d.posAt(now), gridBpm: d.gridBpm, bpm: d.track.bpm * d.rateAt(now), sync: d.synced, sub: now < committed.plan.T0 ? '等待切入' : '切入中', cues: [committed.plan.inPos], lines: L.inc, bw: L.bw };
+    return { t: d.track, pos: d.posAt(now), gridBpm: d.gridBpm, bpm: d.track.bpm * d.rateAt(now), sync: d.synced, sub: now < committed.plan.T0 ? 'Coming in' : 'Mixing in', cues: [committed.plan.inPos], lines: L.inc, bw: L.bw };
   }
-  if (!plan){ const nt = tracks[curIndex() + 1]; return nt ? { t: nt, pos: null, sub: nt.status === 'ready' ? '下一首' : '分析中' } : null; }
+  if (!plan){ const nt = tracks[curIndex() + 1]; return nt ? { t: nt, pos: null, sub: nt.status === 'ready' ? 'Up next' : 'Analyzing' } : null; }
   const ratio = plan.sync.ok ? plan.sync.ratio : 1;
-  return { t: plan.nt, pos: plan.inPos - (plan.T0 - now) * ratio, gridBpm: plan.sync.ok ? plan.sync.cand : plan.nt.bpm, bpm: plan.nt.bpm * ratio, sync: plan.sync.ok, sub: '下一首', cues: [plan.inPos], lines: scr ? [] : L.inc, bw: L.bw };
+  return { t: plan.nt, pos: plan.inPos - (plan.T0 - now) * ratio, gridBpm: plan.sync.ok ? plan.sync.cand : plan.nt.bpm, bpm: plan.nt.bpm * ratio, sync: plan.sync.ok, sub: 'Up next', cues: [plan.inPos], lines: scr ? [] : L.inc, bw: L.bw };
 }
 function fitText(s, w){ if (cx.measureText(s).width <= w) return s; while (s.length > 1 && cx.measureText(s + '…').width > w) s = s.slice(0, -1); return s + '…'; }
 function drawLines(L, x0, w, now){
@@ -1247,11 +1505,11 @@ function drawLane(L, x0, now, gh){
     drawWave(gh.deck.track, gh.deck.posAt(now), 60 / gh.deck.gridBpm, x0, gh.endPos, true);
     drawLines({ lines: gh.lines, bw: gh.bw }, x0, w, now);
   }
-  const head = L || (gh ? { t: gh.deck.track, sub: '已结束', ghostHead: true } : null);
+  const head = L || (gh ? { t: gh.deck.track, sub: 'Finished', ghostHead: true } : null);
   if (!head){ cx.fillStyle = '#3c4453'; cx.font = '500 11px Inter,"Noto Sans SC",sans-serif'; cx.fillText('—', x0, 32); cx.fillStyle = '#5FD3A6'; cx.fillRect(x0 - 2, PLAYY - 1, w + 4, 2); return; }
   const t = head.t;
   cx.fillStyle = head.ghostHead ? '#7d8796' : '#fff'; cx.font = '700 14px Inter,"Noto Sans SC",sans-serif'; cx.fillText(fitText(t.name, w - 2), x0, 30);
-  cx.fillStyle = '#b8c4d3'; cx.font = '400 10px Inter,"Noto Sans SC",sans-serif'; cx.fillText(head.sub || '', x0, 45);
+  cx.fillStyle = '#b8c4d3'; cx.font = '400 10px Inter,"Noto Sans SC",sans-serif'; cx.fillText((head.sub || '') + (t.key ? '  ' + t.key.camelot : ''), x0, 45);
   if (!L || t.status !== 'ready' || L.pos == null){ cx.fillStyle = '#5FD3A6'; cx.fillRect(x0 - 2, PLAYY - 1, w + 4, 2); return; }
   cx.fillStyle = '#fff'; cx.font = '700 11px Inter,sans-serif'; const bt = L.bpm.toFixed(1) + ' BPM'; cx.fillText(bt, x0, 63);
   cx.fillStyle = L.sync ? '#5FD3A6' : '#4a5566'; cx.font = '600 8px Inter,sans-serif'; cx.fillText('SYNC', x0 + cx.measureText(bt).width + 30, 63);
@@ -1285,7 +1543,7 @@ function drawScreen(){
   }
   if (!cur && !ghost){
     cx.fillStyle = '#b8c4d3'; cx.font = '500 12px Inter,"Noto Sans SC",sans-serif'; cx.textAlign = 'center';
-    const lines = ended ? ['歌单播放完了'] : tracks.length ? ['按红色按钮', '开始播放'] : ['添加本地音乐', '开始试听'];
+    const lines = ended ? ['Playlist finished'] : tracks.length ? ['Press the red', 'button to play'] : ['Add local music', 'to get started'];
     lines.forEach((l, i) => cx.fillText(l, SW / 2, 470 + i * 18));
     cx.textAlign = 'left';
   } else {
@@ -1294,7 +1552,9 @@ function drawScreen(){
     drawLane(cur ? laneData(0) : null, 12, now, gh(0)); drawLane(cur ? laneData(1) : null, 122, now, gh(1));
   }
   if (toast && performance.now() < toast.until){
-    cx.font = '600 12px Inter,"Noto Sans SC",sans-serif'; const tw = cx.measureText(toast.text).width + 20;
+    let tfs = 12; cx.font = `600 ${tfs}px Inter,sans-serif`;
+    while (cx.measureText(toast.text).width > SW - 36 && tfs > 8){ tfs -= 0.5; cx.font = `600 ${tfs}px Inter,sans-serif`; }
+    const tw = cx.measureText(toast.text).width + 20;
     cx.fillStyle = 'rgba(232,217,184,.95)'; const x = (SW - tw) / 2;
     cx.beginPath(); cx.roundRect ? cx.roundRect(x, 900, tw, 26, 6) : cx.rect(x, 900, tw, 26); cx.fill();
     cx.fillStyle = '#1b1b1b'; cx.textAlign = 'center'; cx.fillText(toast.text, SW / 2, 917); cx.textAlign = 'left';
@@ -1308,19 +1568,20 @@ const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&':'&amp;', '<':'&lt;', '
 const mmss = x => { x = Math.max(0, x); const m = Math.floor(x / 60), s = Math.floor(x % 60); return m + ':' + String(s).padStart(2, '0'); };
 function gapInfo(i){
   const a = tracks[i], b = tracks[i + 1];
-  if (committed && committed.out.track === a && committed.inc.track === b) return '<div class="gapinfo"><b>过渡进行中</b></div>';
-  if (!(a && b && a.bpm && b.bpm)) return '<div class="gapinfo">等待分析</div>';
+  if (committed && committed.out.track === a && committed.inc.track === b) return '<div class="gapinfo"><b>Transition in progress</b></div>';
+  if (!(a && b && a.bpm && b.bpm)) return '<div class="gapinfo">Waiting for analysis</div>';
   const m = tempoMatch(a.bpm, b.bpm), pct = (m.ratio - 1) * 100;
-  return m.ok ? `<div class="gapinfo">速度差 ${pct >= 0 ? '+' : ''}${pct.toFixed(1)}%，会变速对拍</div>`
-    : `<div class="gapinfo warn">速度相差 ${Math.abs(pct).toFixed(0)}%，无法对拍${resolveSet(globalSet).blend !== 'cut' ? '，长交接会乱拍，这里更适合 Cut' : ''}</div>`;
+  const kt = (a.key && b.key) ? `; key ${a.key.camelot} → ${b.key.camelot}${keyDist(a.key, b.key) <= 1 ? ' (compatible)' : ' (distant)'}` : '';
+  return m.ok ? `<div class="gapinfo">Tempo ${pct >= 0 ? '+' : ''}${pct.toFixed(1)}%, will beatmatch${kt}</div>`
+    : `<div class="gapinfo warn">Tempos ${Math.abs(pct).toFixed(0)}% apart, can't beatmatch${resolveSet(globalSet).blend !== 'cut' ? '; a long blend will clash, Cut works better here' : ''}${kt}</div>`;
 }
 function renderCurSet(){
   const r = resolveSet(globalSet);
   const row = (c, l, v) => `<div><i style="background:var(--c-${c})"></i><span>${l}</span><strong>${v}</strong></div>`;
-  $('#curSet').innerHTML = row('blend', 'BLEND', BLENDS[r.blend] + (r.blend === 'cut' ? '' : '，' + r.bars + ' 小节'))
+  $('#curSet').innerHTML = row('blend', 'BLEND', BLENDS[r.blend] + (r.blend === 'cut' ? '' : ', ' + r.bars + ' bars'))
     + row('build', 'BUILD', BUILDS[r.build]) + row('exit', 'EXIT', EXITS[r.exit])
-    + (globalSet.exit === 'vinyl' && globalSet.blend !== 'cut' ? `<span class="note">Vinyl Break 时 BLEND 暂时固定为 Cut，换掉 Vinyl Break 后恢复 ${BLENDS[globalSet.blend]}。</span>` : '')
-    + '<span class="note">由面板推子控制，之后的过渡都按这组设定进行。</span>';
+    + (globalSet.exit === 'vinyl' && globalSet.blend !== 'cut' ? `<span class="note">While Vinyl Break is on, BLEND is held at Cut. It returns to ${BLENDS[globalSet.blend]} when you turn Vinyl Break off.</span>` : '')
+    + '<span class="note">Set by the faders on the panel. All upcoming transitions use these settings.</span>';
 }
 const ICO = {
   play:'<svg viewBox="0 0 24 24" fill="currentColor"><path d="M7 4.5v15l12.5-7.5z"/></svg>',
@@ -1335,15 +1596,15 @@ function renderList(){
   let h = '';
   tracks.forEach((t, i) => {
     const st = t.status === 'ready'
-      ? `<span class="bpm">${t.bpm.toFixed(t.bpm % 1 ? 1 : 0)} BPM <button class="mini" data-bpm="0.5" data-i="${i}" aria-label="BPM 减半">÷2</button><button class="mini" data-bpm="2" data-i="${i}" aria-label="BPM 加倍">×2</button></span>`
-      : t.status === 'error' ? '<span class="sub">无法解码这个文件</span>' : '<span class="sub">分析中…</span>';
+      ? `<span class="bpm">${t.key ? `<span class="key" title="${t.key.name}">${t.key.camelot}</span>` : ''}${t.bpm.toFixed(t.bpm % 1 ? 1 : 0)} BPM <button class="mini" data-bpm="0.5" data-i="${i}" aria-label="Halve BPM">÷2</button><button class="mini" data-bpm="2" data-i="${i}" aria-label="Double BPM">×2</button></span>`
+      : t.status === 'error' ? `<span class="sub">${esc(t.errMsg || "Can't decode this file")}</span>` : '<span class="sub">Analyzing…</span>';
     h += `<li class="row ${i === ci ? 'current' : ''}"><span class="idx">${i + 1}</span>
-      <div style="min-width:0"><div class="name">${esc(t.name)}</div><div class="sub">${t.duration ? mmss(t.duration) : ''}</div></div>${st}
+      <div style="min-width:0"><div class="name">${esc(t.name)}</div><div class="sub">${t.duration ? mmss(t.duration) : ''}${t.src && t.src.type === 'audius' ? '<span class="src-tag">AUDIUS</span>' : ''}</div></div>${st}
       <div class="acts">
-        <button class="icon" data-act="play" data-i="${i}" aria-label="从这首开始播放" ${t.status !== 'ready' ? 'disabled' : ''}>${ICO.play}</button>
-        <button class="icon" data-act="up" data-i="${i}" aria-label="上移" ${i === 0 ? 'disabled' : ''}>${ICO.up}</button>
-        <button class="icon" data-act="down" data-i="${i}" aria-label="下移" ${i === tracks.length - 1 ? 'disabled' : ''}>${ICO.down}</button>
-        <button class="icon" data-act="del" data-i="${i}" aria-label="移除" ${busy.has(t) ? 'disabled' : ''}>${ICO.del}</button>
+        <button class="icon" data-act="play" data-i="${i}" aria-label="Play from here" ${t.status !== 'ready' ? 'disabled' : ''}>${ICO.play}</button>
+        <button class="icon" data-act="up" data-i="${i}" aria-label="Move up" ${i === 0 ? 'disabled' : ''}>${ICO.up}</button>
+        <button class="icon" data-act="down" data-i="${i}" aria-label="Move down" ${i === tracks.length - 1 ? 'disabled' : ''}>${ICO.down}</button>
+        <button class="icon" data-act="del" data-i="${i}" aria-label="Remove" ${busy.has(t) ? 'disabled' : ''}>${ICO.del}</button>
       </div></li>`;
     if (i < tracks.length - 1) h += `<li class="gap">${gapInfo(i)}</li>`;
   });
@@ -1356,21 +1617,23 @@ $('#tracks').addEventListener('click', e => {
   if (b.dataset.bpm){ const t = tracks[+b.dataset.i]; t.bpm = Math.round(t.bpm * +b.dataset.bpm * 100) / 100; if (cur && cur.track === t) cur.gridBpm = t.bpm; forced = null; renderList(); return; }
   const i = +b.dataset.i, act = b.dataset.act;
   if (act === 'play') startFrom(i);
-  else if (act === 'up' && i > 0){ [tracks[i - 1], tracks[i]] = [tracks[i], tracks[i - 1]]; afterReorder(); }
-  else if (act === 'down' && i < tracks.length - 1){ [tracks[i + 1], tracks[i]] = [tracks[i], tracks[i + 1]]; afterReorder(); }
-  else if (act === 'del'){ const [t] = tracks.splice(i, 1); bufCache.delete(t.id); afterReorder(); }
+  else if (act === 'up' && i > 0){ [tracks[i - 1], tracks[i]] = [tracks[i], tracks[i - 1]]; manualOrder = true; afterReorder(); }
+  else if (act === 'down' && i < tracks.length - 1){ [tracks[i + 1], tracks[i]] = [tracks[i], tracks[i + 1]]; manualOrder = true; afterReorder(); }
+  else if (act === 'del'){ const [t] = tracks.splice(i, 1); bufCache.delete(t.id); afterReorder(); renderAudius(); }
 });
 function afterReorder(){ forced = null; if (ctx){ pruneCache(); const n = tracks[curIndex() + 1]; if (n && cur) ensureBuffer(n); } renderList(); }
 function addFiles(list){
   const files = [...list].filter(f => f.type.startsWith('audio/') || /\.(mp3|wav|flac|m4a|aac|ogg|aiff?|opus)$/i.test(f.name));
   if (!files.length) return;
   getCtx();
-  files.forEach(f => { const t = { id: uid++, file: f, name: f.name.replace(/\.[^.]+$/, ''), status: 'analyzing' }; tracks.push(t); queueAnalysis(t); });
+  const batch = files.map(f => { const t = { id: uid++, file: f, name: f.name.replace(/\.[^.]+$/, ''), status: 'analyzing' }; tracks.push(t); queueAnalysis(t); return t; });
+  analyzing = analyzing.then(() => autoSort(batch));
   renderList();
 }
 $('#addBtn').onclick = () => $('#fileIn').click();
 $('#fileIn').onchange = e => { addFiles(e.target.files); e.target.value = ''; };
 $('#jumpBtn').onclick = () => jumpToTransition();
+$('#sortBtn').onclick = () => autoSort(null);
 ['#drop', '#tracks'].forEach(sel => {
   const el = $(sel);
   el.addEventListener('dragover', e => { e.preventDefault(); el.classList.add('over'); });
@@ -1379,6 +1642,16 @@ $('#jumpBtn').onclick = () => jumpToTransition();
 });
 onDoc('dragover', e => e.preventDefault());
 onDoc('drop', e => { e.preventDefault(); if (!e.target.closest('#drop,#tracks')) addFiles(e.dataTransfer.files); });
+onDoc('keydown', e => { if (e.key === 'Shift' && !e.repeat) shiftDown(); });
+onDoc('keydown', e => {
+  const d = amtKeyDir(e); if (!d || e.target.closest('input,textarea')) return;
+  e.preventDefault();
+  if (!amtKeys[d]){ amtKeys[d] = true; amtKeys.since = amtKeys.t = performance.now(); setAmt(fx.amt + (d === 'inc' ? AMT_TAP : -AMT_TAP)); }
+});
+onDoc('keyup', e => { const d = amtKeyDir(e); if (d) amtKeys[d] = false; });
+onDoc('visibilitychange', () => { amtKeys.dec = amtKeys.inc = false; });
+onDoc('keyup', e => { if (e.key === 'Shift') shiftUp(); });
+onDoc('visibilitychange', () => { shiftState.held = false; renderShift(); });
 onDoc('keydown', e => {
   if (e.target.closest('input,textarea,[role="slider"],[role="button"],button')) return;
   if (e.code === 'Space'){ e.preventDefault(); togglePlay(); }
@@ -1390,33 +1663,34 @@ onDoc('keydown', e => {
 function updateStatus(){
   const el = $('#status');
   $('#jumpBtn').disabled = !(cur && !committed && tracks[curIndex() + 1]);
-  if (!cur || !ctx){ el.innerHTML = ended ? '歌单播放完了。' : tracks.length ? '按转盘中间的红色按钮开始播放。' : '添加音乐后按转盘中间的红色按钮开始。'; return; }
+  if (!cur || !ctx){ el.innerHTML = ended ? 'Playlist finished.' : tracks.length ? 'Press the red button in the middle of the jog wheel to play.' : 'Add music, then press the red button in the middle of the jog wheel to start.'; return; }
   const now = ctx.currentTime, ci = curIndex();
   let st = '', sub = '';
   if (committed){
     const p = committed.plan;
-    if (now < p.Tb) st = `过渡即将开始，${mmss(p.Tb - now)} 后`;
-    else if (now < p.T0) st = `BUILD：${BUILDS[p.s.build]}`;
-    else if (p.s.blend === 'cut' && now < p.Tc) st = 'BLEND：Cut，下一拍切换';
-    else if (now < p.T1){ const bar = Math.min(p.blendBars, Math.floor((now - p.T0) / p.barWall) + 1); st = `BLEND：${BLENDS[p.s.blend]}，第 ${bar} / ${p.blendBars} 小节`; }
-    else st = `EXIT：${EXITS[p.s.exit]}`;
-    sub = `正在切入 ${committed.inc.track.name}`;
+    if (now < p.Tb) st = `Transition starts in ${mmss(p.Tb - now)}`;
+    else if (now < p.T0) st = `BUILD: ${BUILDS[p.s.build]}`;
+    else if (p.s.blend === 'cut' && now < p.Tc) st = 'BLEND: Cut on the next beat';
+    else if (now < p.T1){ const bar = Math.min(p.blendBars, Math.floor((now - p.T0) / p.barWall) + 1); st = `BLEND: ${BLENDS[p.s.blend]}, bar ${bar} / ${p.blendBars}`; }
+    else st = `EXIT: ${EXITS[p.s.exit]}`;
+    sub = `Mixing in ${committed.inc.track.name}`;
   } else {
     const plan = planNext();
     if (plan){
       const s = plan.s;
-      st = `下一次过渡 ${mmss(plan.Tb - now)} 后开始`;
-      sub = `BLEND ${BLENDS[s.blend]}${s.blend === 'cut' ? '' : ' ' + plan.blendBars + ' 小节'}，BUILD ${BUILDS[s.build]}，EXIT ${EXITS[s.exit]}。${plan.sync.ok ? '会变速对拍。' : '速度差距大，不对拍。'}`;
-    } else if (tracks[ci + 1]) st = '下一首还在分析，完成后会自动安排过渡。';
-    else st = '这是歌单最后一首。';
+      st = `Next transition in ${mmss(plan.Tb - now)}`;
+      sub = `BLEND ${BLENDS[s.blend]}${s.blend === 'cut' ? '' : ' ' + plan.blendBars + ' bars'}, BUILD ${BUILDS[s.build]}, EXIT ${EXITS[s.exit]}. ${plan.sync.ok ? 'Will beatmatch.' : 'Tempos too far apart to beatmatch.'}`;
+    } else if (tracks[ci + 1]) st = 'The next song is still being analyzed; the transition will be scheduled when it is ready.';
+    else st = 'This is the last song in the playlist.';
   }
-  if (!playing) st = '已暂停。' + st;
+  if (!playing) st = 'Paused. ' + st;
   el.innerHTML = esc(st) + (sub ? `<span class="sub">${esc(sub)}</span>` : '');
 }
 let lastStatus = 0, lastRing = null;
 function frame(ts){
   if (!alive) return;
   requestAnimationFrame(frame);
+  stepAmtKeys();
   if (!ringDragging){ ringShown += (ringTarget - ringShown) * 0.25; if (Math.abs(ringTarget - ringShown) < 0.05) ringShown = ringTarget; }
   if (ringShown !== lastRing){
     lastRing = ringShown;
@@ -1425,12 +1699,156 @@ function frame(ts){
   }
   if (cur && ctx){
     const pos = scr ? scr.pos : cur.posAt(ctx.currentTime);
-    const secPerRev = 16 * 60 / cur.track.bpm;
+    const secPerRev = SCRATCH_SEC_PER_REV;
     Q('#jogRot').setAttribute('transform', `rotate(${(pos / secPerRev * 360) % 360} ${JC.x} ${JC.y})`);
   }
   drawScreen();
   if (ts - lastStatus > 200){ lastStatus = ts; updateStatus(); if (committed) renderDevice(); }
 }
+// ================= user manual (line drawing + control list) =================
+const MANUAL = [
+  { g:'Screen' },
+  { n:1, x:173, y:560, name:'Screen', desc:'Two scrolling lanes: the song that is playing and the next one, with waveform, BPM, key, SYNC and bar position. Colored lines show BLEND (pink), BUILD (green) and EXIT (cyan).', keys:[] },
+  { g:'Transition' },
+  { n:2, x:345, y:350, name:'BLEND fader', desc:'How the two songs hand over: Fade, Bass Swap, Filter or Cut.', keys:[] },
+  { n:3, x:470, y:619, name:'Length keys', desc:'Length of the blend: 4, 8 or 16 bars.', keys:[] },
+  { n:4, x:463, y:350, name:'BUILD fader', desc:'Build-up before the handover: None, Loop Roll, Riser or Swoosh.', keys:[] },
+  { n:5, x:581, y:350, name:'EXIT fader', desc:'How the old song ends: None, Echo, Reverb, Downsweep or Vinyl Break (Vinyl Break always uses Cut).', keys:[] },
+  { n:11, x:394, y:760, name:'MIX key', desc:'Starts the transition at the next bar instead of waiting for the end of the song.', keys:['M'] },
+  { g:'Effects' },
+  { n:6, x:732, y:290, name:'FX ring', desc:'Turn an effect under the “I” mark to switch it on: Echo, Reverb, Flanger, Gater or Roll. NONE switches it off.', keys:[] },
+  { n:7, x:880, y:290, name:'FILTER knob', desc:'Left for low-pass, right for high-pass, double-click to reset. Works together with the FX ring.', keys:[] },
+  { n:8, x:1135, y:18, name:'FX amount lever', desc:'Strength of the active effect.', keys:['[', ']'] },
+  { g:'Playback' },
+  { n:10, x:880, y:705, name:'Play / pause', desc:'Starts the playlist, pauses and resumes.', keys:['Space'] },
+  { n:9, x:880, y:585, name:'Jog wheel', desc:'Drag the outer ring to scratch, about 1.8 s per turn. Hold SHIFT while turning to move fast, about 32 bars per turn.', keys:['drag', 'Shift+drag'] },
+  { n:14, x:-35, y:204, name:'Volume key', desc:'Top half turns the volume up, bottom half turns it down.', keys:[] },
+  { g:'Samples' },
+  { n:12, x:1010, y:998, name:'Sample pads', desc:'DRUM, BASS, MELODY and VOCAL one-shots. Pressing a looping pad stops its loop.', keys:['1', '2', '3', '4'] },
+  { n:13, x:-35, y:948, name:'SHIFT key', desc:'Tap right after a pad to loop that sample in time with the beat. Hold while turning the jog wheel to move fast.', keys:['Shift'] },
+  { n:15, x:1150, y:324, name:'Sample set key', desc:'Switches all four pads to the next of 8 sample sets.', keys:[] }
+];
+{ let k = 0; MANUAL.forEach(m => { if (!m.g) m.n = ++k; }); }   // number the parts in list order
+function buildManualArt(){
+  const L = (x1, y1, x2, y2) => `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}"/>`;
+  const R = (x, y, w, h, r) => `<rect x="${x}" y="${y}" width="${w}" height="${h}" rx="${r}"/>`;
+  const C = (x, y, r) => `<circle cx="${x}" cy="${y}" r="${r}"/>`;
+  const txt = (x, y, s, size = 26) => `<text x="${x}" y="${y}" text-anchor="middle" font-size="${size}" font-weight="700" fill="currentColor" stroke="none">${s}</text>`;
+  let art = '';
+  art += R(28, 22, 1068, 1066, 58);
+  art += R(2, 118, 16, 172, 8) + R(2, 908, 16, 80, 8) + R(1098, 262, 16, 124, 8);
+  art += `<path d="M1030 22 A74 74 0 0 1 1104 96" stroke-width="22" stroke-linecap="round"/><path d="M1030 22 A74 74 0 0 1 1104 96" stroke-width="16" stroke-linecap="round" stroke="var(--panel)"/>`;
+  art += R(45, 43, 256, 1022, 28) + R(57, 54, 232, 1000, 19) + L(173, 90, 173, 1030) + L(70, 400, 276, 400);
+  for (const x of [401, 519, 637]){ art += R(x - 7, 133, 14, 435, 7) + C(x, 133, 22); }
+  art += txt(372, 90, 'BLEND') + txt(490, 90, 'BUILD') + txt(608, 90, 'EXIT');
+  art += R(318, 604, 34, 30, 7) + R(358, 604, 34, 30, 7) + R(398, 604, 34, 30, 7);
+  art += txt(880, 88, 'I', 34);
+  art += C(880, 290, 191) + C(880, 290, 96) + L(880, 290, 880, 226);
+  for (let i = 0; i < 6; i++){ const a = (i * 60 - 90) * Math.PI / 180; art += C(880 + 146 * Math.cos(a), 290 + 146 * Math.sin(a), 7); }
+  art += C(880, 705, 186) + C(880, 705, 48) + L(976, 700, 1062, 700);
+  art += R(345, 800, 98, 56, 12) + txt(394, 838, 'MIX');
+  art += R(527, 940, 440, 117, 18);
+  for (let i = 0; i < 4; i++) art += R(538 + i * 107, 951, 95, 95, 11);
+  const badges = MANUAL.filter(m => m.n).map(m =>
+    `<g class="mbadge" data-n="${m.n}"><circle cx="${m.x}" cy="${m.y}" r="31"/><text x="${m.x}" y="${m.y + 11}" text-anchor="middle" font-size="31" font-weight="800">${m.n}</text></g>`).join('');
+  return `<svg viewBox="-80 -30 1260 1130" role="img" aria-label="Line drawing of the DJMAN panel with numbered controls">
+    <g fill="none" stroke="currentColor" stroke-width="4" stroke-linejoin="round" font-family="Inter,system-ui,sans-serif">${art}</g>${badges}</svg>`;
+}
+function renderManual(){
+  const host = document.getElementById('manual'); if (!host) return;
+  const kb = k => k === 'drag' ? '<span class="kdrag">drag</span>' : k === 'Shift+drag' ? '<kbd>Shift</kbd><span class="kdrag">+ drag</span>' : `<kbd>${k}</kbd>`;
+  const row = m => m.g ? `<li class="grp">${m.g}</li>` :
+    `<li data-n="${m.n}"><span class="n">${m.n}</span><span><b>${m.name}</b>${m.desc}</span><span class="k">${m.keys.length ? m.keys.map(kb).join('') : '<span class="none">—</span>'}</span></li>`;
+  // split the groups into two text columns of roughly equal length
+  const groups = []; MANUAL.forEach(m => { if (m.g) groups.push([m]); else groups[groups.length - 1].push(m); });
+  const len = g => g.reduce((s, m) => s + (m.desc ? m.desc.length + 60 : 30), 0), total = groups.reduce((s, g) => s + len(g), 0);
+  let acc = 0, cut = groups.length;
+  for (let i = 0; i < groups.length; i++){ if (acc + len(groups[i]) / 2 > total / 2){ cut = i; break; } acc += len(groups[i]); }
+  const head = '<li class="head"><span></span><span>Control</span><span>Keyboard</span></li>';
+  const col = gs => `<ol class="manual-list">${head}${gs.flat().map(row).join('')}</ol>`;
+  host.innerHTML = `<div class="manual-grid">
+    <div class="manual-left"><figure class="manual-art">${buildManualArt()}</figure>
+      <p class="manual-note">Fader and FX settings apply to every upcoming transition and take effect right away, even during a transition. Panel controls can also be selected with <kbd>Tab</kbd> and adjusted with the arrow keys. <b>Jump to transition</b> in the Status card (<kbd>J</kbd>) skips to just before the next transition.</p></div>
+    ${col(groups.slice(0, cut))}${col(groups.slice(cut))}</div>`;
+  const setOn = (n, on) => { const b = host.querySelector(`.mbadge[data-n="${n}"]`); if (b) b.classList.toggle('on', on); };
+  host.querySelectorAll('.manual-list li[data-n]').forEach(li => {
+    li.addEventListener('mouseenter', () => setOn(li.dataset.n, true));
+    li.addEventListener('mouseleave', () => setOn(li.dataset.n, false));
+  });
+}
+// ================= Audius (open music catalog) =================
+// Docs: https://docs.audius.co/api — streaming returns the MP3 file, so Audius tracks go
+// through the same analysis and mixing engine as local files.
+const AUDIUS_API = 'https://api.audius.co/v1';
+const AUDIUS_APP = 'DJMAN';
+const AUDIUS_API_KEY = '';   // optional: a free key from api.audius.co/plans raises the rate limit
+const AUDIUS_GENRES = ['All genres', 'Electronic', 'House', 'Deep House', 'Techno', 'Tech House', 'Drum & Bass', 'Dubstep', 'Trance', 'Hip-Hop/Rap', 'Pop', 'Lo-Fi', 'R&B/Soul'];
+function audiusQuery(extra){
+  const p = new URLSearchParams({ app_name: AUDIUS_APP, ...extra });
+  if (AUDIUS_API_KEY) p.set('api_key', AUDIUS_API_KEY);
+  return p.toString();
+}
+async function audiusGet(path, extra){
+  const r = await fetch(`${AUDIUS_API}${path}?${audiusQuery(extra || {})}`);
+  if (!r.ok) throw new Error('Audius error ' + r.status);
+  const j = await r.json();
+  return j.data || [];
+}
+const audiusPlayable = x => x && x.id && x.is_streamable !== false && !x.stream_conditions && !x.is_stream_gated && x.is_available !== false;
+async function fetchAudiusBytes(id){
+  const r = await fetch(`${AUDIUS_API}/tracks/${encodeURIComponent(id)}/stream?${audiusQuery({})}`);
+  if (!r.ok) throw new Error(r.status === 404 ? 'This track has no audio' : 'Audius error ' + r.status);
+  return await r.arrayBuffer();
+}
+let audiusResults = [];
+function renderAudius(msg){
+  const box = document.getElementById('audiusResults'); if (!box) return;
+  if (msg){ box.innerHTML = `<p class="au-msg">${esc(msg)}</p>`; return; }
+  if (!audiusResults.length){ box.innerHTML = ''; return; }
+  const inList = new Set(tracks.filter(t => t.src && t.src.type === 'audius').map(t => t.src.id));
+  box.innerHTML = '<ul class="au-list">' + audiusResults.map((x, i) => {
+    const art = x.artwork && (x.artwork['150x150'] || x.artwork['480x480']);
+    const link = x.permalink ? `https://audius.co${x.permalink}` : '';
+    const added = inList.has(x.id);
+    return `<li>
+      ${art ? `<img src="${esc(art)}" alt="" loading="lazy">` : '<span class="au-noart"></span>'}
+      <div class="au-meta"><a class="au-title" ${link ? `href="${esc(link)}" target="_blank" rel="noopener"` : ''}>${esc(x.title || 'Untitled')}</a>
+        <span>${esc((x.user && x.user.name) || 'Unknown artist')}${x.duration ? '  ' + mmss(x.duration) : ''}${x.genre ? '  ' + esc(x.genre) : ''}</span></div>
+      <button class="hbtn au-add" data-au="${i}" ${added ? 'disabled' : ''}>${added ? 'Added' : 'Add'}</button></li>`;
+  }).join('') + '</ul><p class="au-credit">Music from <a href="https://audius.co" target="_blank" rel="noopener">Audius</a>. Titles link to the artist\'s page.</p>';
+}
+async function audiusLoad(kind){
+  const q = ($('#audiusQ').value || '').trim(), genre = $('#audiusGenre').value;
+  if (kind === 'search' && !q){ renderAudius('Type an artist or song name to search.'); return; }
+  renderAudius(kind === 'search' ? 'Searching Audius…' : 'Loading trending tracks…');
+  try {
+    const params = kind === 'search' ? { query: q } : { time: 'week', ...(genre && genre !== 'All genres' ? { genre } : {}) };
+    const data = await audiusGet(kind === 'search' ? '/tracks/search' : '/tracks/trending', params);
+    audiusResults = data.filter(audiusPlayable).slice(0, 20);
+    if (!audiusResults.length) renderAudius('No playable tracks found.');
+    else renderAudius();
+  } catch(e){
+    renderAudius("Couldn't reach Audius. Check the internet connection and try again.");
+  }
+}
+function addAudiusTrack(x){
+  if (tracks.some(t => t.src && t.src.type === 'audius' && t.src.id === x.id)){ showToast('Already in the playlist'); return; }
+  getCtx();
+  const t = { id: uid++, src: { type:'audius', id: x.id }, name: `${(x.user && x.user.name) || 'Unknown'} – ${x.title || 'Untitled'}`, status: 'analyzing' };
+  tracks.push(t); queueAnalysis(t);
+  analyzing = analyzing.then(() => autoSort([t]));
+  renderList(); renderAudius();
+}
+(() => {
+  const g = document.getElementById('audiusGenre');
+  if (g) g.innerHTML = AUDIUS_GENRES.map(x => `<option>${x}</option>`).join('');
+  const s = document.getElementById('audiusSearch'), tr = document.getElementById('audiusTrending'), q = document.getElementById('audiusQ'), box = document.getElementById('audiusResults');
+  if (s) s.onclick = () => audiusLoad('search');
+  if (tr) tr.onclick = () => audiusLoad('trending');
+  if (q) q.addEventListener('keydown', e => { if (e.key === 'Enter'){ e.preventDefault(); audiusLoad('search'); } });
+  if (box) box.addEventListener('click', e => { const b = e.target.closest('[data-au]'); if (b && !b.disabled) addAudiusTrack(audiusResults[+b.dataset.au]); });
+})();
+renderManual();
 renderList(); requestAnimationFrame(frame);
 
 return () => {
